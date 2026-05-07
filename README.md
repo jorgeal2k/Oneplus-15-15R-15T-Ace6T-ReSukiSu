@@ -1,4 +1,4 @@
-# Build OnePlus 15 / 15R / Ace 6T — ReSukiSU Kernel Builder
+# Build OnePlus 15 / 15R / 15T / Ace 6T — ReSukiSU Kernel Builder
 
 A GitHub Actions workflow that builds an **Android GKI kernel**, integrates **ReSukiSU** (KernelSU fork), optionally applies **SUSFS**, and packages the result as a flashable **AnyKernel3 ZIP**.
 
@@ -10,6 +10,7 @@ It’s designed for configurable CI runs with useful build metadata (**hashes, s
 
 - **Multi-device support**
   - `oneplus15` → OnePlus 15 (**sm8850**)
+  - `oneplus15T` → OnePlus 15 (**sm8850**)
   - `oneplus15r` → OnePlus 15R (**sm8845**)
   - `ace6t` → OnePlus Ace 6T (**sm8845**)
 - **ReSukiSU integration** via upstream `setup.sh` (supports `KSU_META`)
