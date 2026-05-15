@@ -138,13 +138,17 @@ jobs:
 
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
-      CCACHE_MAXSIZE: 12G
+      CCACHE_MAXSIZE: 15G
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
-      CCACHE_SLOPPINESS: "include_file_mtime,include_file_ctime,time_macros,file_macro"
+      CCACHE_SLOPPINESS: "include_file_mtime,include_file_ctime,time_macros,file_macro,system_headers"
       CCACHE_BASEDIR: ${{ github.workspace }}/kernel_workspace
       CCACHE_LOGFILE: ${{ github.workspace }}/ccache.log
+      CCACHE_UMASK: "002"
+
+      BAZEL_CACHE_DIR: ${{ github.workspace }}/.bazel-cache
+      BAZELISK_HOME: ${{ github.workspace }}/.bazelisk
 
       LSM_ENABLED: ${{ inputs.LSM && '1' || '0' }}
       NETFILTER_ENABLED: ${{ inputs.NETFILTER && '1' || '0' }}
@@ -157,7 +161,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        uses: actions/checkout@v4
 
       - name: Set Device Configuration
         id: device_config
@@ -273,7 +277,7 @@ jobs:
 
       - name: Maximize Build Space
         if: ${{ !inputs.SPACE_NOCLEAN }}
-        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
+        uses: easimon/maximize-build-space@v10
         with:
           root-reserve-mb: 8192
           temp-reserve-mb: 2048
@@ -333,9 +337,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/*.yml') }}
+          key: ccache-${{ runner.os }}-${{ steps.device_config.outputs.KERNEL_BRANCH }}-${{ inputs.KSU_SETUP_BRANCH }}-${{ hashFiles('.github/workflows/*.yml') }}
           restore-keys: |
-            ccache-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
+            ccache-${{ runner.os }}-${{ steps.device_config.outputs.KERNEL_BRANCH }}-${{ inputs.KSU_SETUP_BRANCH }}-
+            ccache-${{ runner.os }}-${{ steps.device_config.outputs.KERNEL_BRANCH }}-
             ccache-${{ runner.os }}-
 
       - name: Initialize Ccache
@@ -343,17 +348,23 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
           mkdir -p "$CCACHE_DIR"
+          mkdir -p "${RUNNER_TEMP}/ccache-tmp"
 
           ccache --set-config=max_size="${CCACHE_MAXSIZE}"
           ccache --set-config=compression=true
           ccache --set-config=compression_level=6
           ccache --set-config=hard_link=true || true
           ccache --set-config=compiler_check="%compiler% -dumpmachine; %compiler% -dumpversion"
-          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,time_macros,file_macro
+          ccache --set-config=sloppiness=include_file_mtime,include_file_ctime,time_macros,file_macro,system_headers
+          ccache --set-config=hash_dir=false
+          ccache --set-config=temporary_dir="${RUNNER_TEMP}/ccache-tmp"
 
           echo "CCACHE_DIR=$CCACHE_DIR"
           echo "CCACHE_BASEDIR=$CCACHE_BASEDIR"
+          echo "CCACHE_MAXSIZE=$CCACHE_MAXSIZE"
+
           ccache -p
           ccache -s
           ccache -z
@@ -362,11 +373,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            ${{ env.BAZEL_CACHE_DIR }}
+            ${{ env.BAZELISK_HOME }}
             ~/.cache/bazel
             ~/.cache/bazelisk
-          key: bazel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/*.yml') }}
+          key: bazel-${{ runner.os }}-${{ steps.device_config.outputs.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/*.yml') }}
           restore-keys: |
-            bazel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
+            bazel-${{ runner.os }}-${{ steps.device_config.outputs.KERNEL_BRANCH }}-
             bazel-${{ runner.os }}-
 
       - name: Install Repo Tool
@@ -400,33 +413,58 @@ jobs:
             local max_attempts=3
             local timeout_s=5
             local attempt=1
+
             while [ "$attempt" -le "$max_attempts" ]; do
               echo "🔄 Attempt $attempt/$max_attempts: $*"
+
               if "$@"; then
                 return 0
               fi
+
               sleep "$timeout_s"
               timeout_s=$((timeout_s * 2))
               attempt=$((attempt + 1))
             done
+
             return 1
           }
 
           mkdir -p kernel_workspace
           cd kernel_workspace
 
-          retry_command repo init -u https://android.googlesource.com/kernel/manifest \
-            -b "common-${KERNEL_BRANCH}" \
-            --depth=1 --no-clone-bundle --no-tags
+          echo "🚀 Initializing repo for common-${KERNEL_BRANCH}"
 
-          retry_command repo sync -c -j"$(nproc)" \
-            --prune --no-clone-bundle --no-tags --force-sync --current-branch
+          retry_command repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "common-${KERNEL_BRANCH}" \
+            --depth=1 \
+            --no-clone-bundle \
+            --no-tags
+
+          echo "🚀 Syncing kernel source"
+
+          SYNC_JOBS="$(nproc)"
+          if [ "$SYNC_JOBS" -gt 8 ]; then
+            SYNC_JOBS=8
+          fi
+
+          retry_command repo sync \
+            -c \
+            -j"${SYNC_JOBS}" \
+            --prune \
+            --no-clone-bundle \
+            --no-tags \
+            --force-sync \
+            --current-branch \
+            --optimized-fetch
 
           if [ -e "common/BUILD.bazel" ]; then
             sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' common/BUILD.bazel
           fi
 
           rm -f common/android/abi_gki_protected_exports_* 2>/dev/null || true
+
+          echo "✅ Repo sync completed"
 
       - name: Kernel Version Handling
         shell: bash
@@ -499,6 +537,7 @@ jobs:
             else
               echo "echo \"\$res-${SUFFIX}\"" >> "$path"
             fi
+
             chmod +x "$path"
           }
 
@@ -511,6 +550,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           case "${{ inputs.MANAGER_SOURCE }}" in
             MD3_SPOOF)
               echo "manager_branch=main" >> "$GITHUB_OUTPUT"
@@ -652,6 +692,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           SUSFS_DIR="$GITHUB_WORKSPACE/kernel_workspace/susfs4ksu"
           [ -d "$SUSFS_DIR" ] || exit 1
           cd "$SUSFS_DIR"
@@ -667,6 +708,7 @@ jobs:
           else
             SUSFS_VER="2.0.0+"
           fi
+
           echo "SUSVER=${SUSFS_VER}" >> "$GITHUB_ENV"
 
       - name: Apply Unicode Bypass
@@ -674,6 +716,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           PATCH_DIR="${GITHUB_WORKSPACE}/kernel_workspace/Action-Build/patches"
           cd kernel_workspace/common
 
@@ -688,6 +731,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd kernel_workspace/common
 
           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash -s main || true
@@ -699,6 +743,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd kernel_workspace/common
 
           CONFIG_FILE=./arch/arm64/configs/gki_defconfig
@@ -796,10 +841,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           PATCH_DIR="${GITHUB_WORKSPACE}/kernel_workspace/Action-Build/patches"
           cd kernel_workspace/common
+
           if [[ "${CPU}" == sm* ]]; then
-            patch -p1 -F 3 < "${PATCH_DIR}/IPv6_NAT_FIX.patch"
+            echo "Patching IPv6_NAT_FIX.patch"
+
+            if ! patch -p1 -F 3 < "${PATCH_DIR}/IPv6_NAT_FIX.patch"; then
+              echo "::error::IPv6_NAT_FIX patch failed. Dumping all .rej files:"
+              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
+              exit 1
+            fi
           fi
 
       - name: Custom BUILD_TIME
@@ -808,6 +861,7 @@ jobs:
           set -euo pipefail
 
           INPUT_TIME="${{ inputs.BUILD_TIME }}"
+
           if [[ -n "$INPUT_TIME" && "$INPUT_TIME" != "F" && "$INPUT_TIME" != "f" ]]; then
             DATESTR="$INPUT_TIME"
           else
@@ -818,6 +872,7 @@ jobs:
           echo "KBUILD_BUILD_VERSION=1" >> "$GITHUB_ENV"
 
           cd kernel_workspace
+
           for f in common/scripts/mkcompile_h msm-kernel/scripts/mkcompile_h; do
             if [ -f "$f" ]; then
               if grep -q 'UTS_VERSION=' "$f"; then
@@ -833,6 +888,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           sed -i '0,/protected_module_names_list *= *":gki_aarch64_protected_module_names"/s//check_defconfig = "disabled"/' \
             kernel_workspace/common/BUILD.bazel || true
 
@@ -840,6 +896,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd kernel_workspace/common
 
           echo "::group::SELinux symbol references"
@@ -854,8 +911,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           df -h
           AVAIL_GB=$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2{gsub("G","",$4); print $4}')
+
           if [ "${AVAIL_GB:-0}" -lt 10 ]; then
             echo "❌ ERROR: Only ${AVAIL_GB}GB free. Minimum 10GB required"
             exit 1
@@ -865,47 +924,113 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd kernel_workspace
           ROOT="$PWD"
 
-          NPROC=$(nproc)
-          BUILD_THREADS=$((NPROC + 2))
+          NPROC="$(nproc)"
+          BUILD_THREADS="$((NPROC + 2))"
 
           export MAKEFLAGS="-j${BUILD_THREADS}"
-
-          if [ "${BUILD_NOCCACHE_ENABLED}" != "1" ]; then
-            export PATH="/usr/lib/ccache:$PATH"
-            export CCACHE_DIR="${CCACHE_DIR}"
-            export CCACHE_BASEDIR="${GITHUB_WORKSPACE}/kernel_workspace"
-            export CCACHE_NOHASHDIR=true
-            export CCACHE_COMPILERCHECK="%compiler% -dumpmachine; %compiler% -dumpversion"
-            export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros,file_macro"
-            export CCACHE_LOGFILE="${GITHUB_WORKSPACE}/ccache.log"
-            ccache -s || true
-          fi
-
-          trap 'echo "🧹 Cleaning intermediate files..."; rm -rf "$ROOT/common/out/"*/intermediates "$ROOT/out/"*/intermediates 2>/dev/null || true' EXIT
 
           echo "🚀 Starting kernel build at $(date)"
           echo "🔧 CPU Cores: ${NPROC}"
           echo "🔧 Build Threads: ${BUILD_THREADS}"
 
-          if [ -f "build/build.sh" ]; then
-            time LTO=none BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tee "$ROOT/build.log"
+          if [ "${BUILD_NOCCACHE_ENABLED}" != "1" ]; then
+            echo "⚡ Enabling ccache"
+
+            export PATH="/usr/lib/ccache:$PATH"
+            export USE_CCACHE=1
+            export CCACHE_EXEC="$(command -v ccache)"
+            export CCACHE_DIR="${CCACHE_DIR}"
+            export CCACHE_BASEDIR="${GITHUB_WORKSPACE}/kernel_workspace"
+            export CCACHE_NOHASHDIR=true
+            export CCACHE_COMPILERCHECK="%compiler% -dumpmachine; %compiler% -dumpversion"
+            export CCACHE_SLOPPINESS="include_file_mtime,include_file_ctime,time_macros,file_macro,system_headers"
+            export CCACHE_LOGFILE="${GITHUB_WORKSPACE}/ccache.log"
+
+            export CC="ccache clang"
+            export CXX="ccache clang++"
+            export HOSTCC="ccache clang"
+            export HOSTCXX="ccache clang++"
+
+            echo "ccache path: $(command -v ccache)"
+            echo "clang path: $(command -v clang || true)"
+            ccache -s || true
           else
+            echo "🧹 BUILD_NOCCACHE enabled, ccache disabled"
+          fi
+
+          mkdir -p "${BAZEL_CACHE_DIR}"
+          mkdir -p "${BAZEL_CACHE_DIR}/repository"
+          mkdir -p "${BAZELISK_HOME}"
+
+          export BAZELISK_HOME="${BAZELISK_HOME}"
+
+          trap 'echo "🧹 Cleaning intermediate files..."; rm -rf "$ROOT/common/out/"*/intermediates "$ROOT/out/"*/intermediates 2>/dev/null || true' EXIT
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Build environment"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "KERNEL_BRANCH=${KERNEL_BRANCH}"
+          echo "BAZEL_CACHE_DIR=${BAZEL_CACHE_DIR}"
+          echo "BAZELISK_HOME=${BAZELISK_HOME}"
+          echo "CCACHE_DIR=${CCACHE_DIR}"
+          echo "CCACHE_BASEDIR=${CCACHE_BASEDIR}"
+          echo "PATH=${PATH}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          if [ -f "build/build.sh" ]; then
+            echo "🏗️ Using build/build.sh path"
+
+            time env \
+              LTO=none \
+              BUILD_CONFIG=common/build.config.gki.aarch64 \
+              USE_CCACHE="${USE_CCACHE:-0}" \
+              CCACHE_EXEC="${CCACHE_EXEC:-}" \
+              CCACHE_DIR="${CCACHE_DIR:-}" \
+              CCACHE_BASEDIR="${CCACHE_BASEDIR:-}" \
+              build/build.sh 2>&1 | tee "$ROOT/build.log"
+
+          else
+            echo "🏗️ Using Bazel/Kleaf path"
+
+            BAZEL_ARGS=(
+              --config=fast
+              --lto=none
+              --jobs="${BUILD_THREADS}"
+              --disk_cache="${BAZEL_CACHE_DIR}"
+              --repository_cache="${BAZEL_CACHE_DIR}/repository"
+              --experimental_repository_cache_hardlinks
+              --action_env=USE_CCACHE="${USE_CCACHE:-0}"
+              --action_env=CCACHE_EXEC="${CCACHE_EXEC:-}"
+              --action_env=CCACHE_DIR="${CCACHE_DIR:-}"
+              --action_env=CCACHE_BASEDIR="${CCACHE_BASEDIR:-}"
+              --action_env=CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-true}"
+              --action_env=CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-%compiler% -dumpmachine; %compiler% -dumpversion}"
+              --action_env=CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-include_file_mtime,include_file_ctime,time_macros,file_macro,system_headers}"
+              --action_env=CCACHE_LOGFILE="${CCACHE_LOGFILE:-}"
+            )
+
             time tools/bazel build \
-              --config=fast \
-              --lto=none \
-              --jobs="${BUILD_THREADS}" \
+              "${BAZEL_ARGS[@]}" \
               //common:kernel_aarch64_dist 2>&1 | tee "$ROOT/build.log"
           fi
 
           echo "✅ Kernel build completed at $(date)"
 
+          if [ "${BUILD_NOCCACHE_ENABLED}" != "1" ]; then
+            echo "📊 ccache stats after build:"
+            ccache -s || true
+          fi
+
       - name: Ccache Statistics and Debug
         if: ${{ always() && !inputs.BUILD_NOCCACHE }}
         shell: bash
         run: |
+          set +e
+
           echo "::group::Ccache stats"
           ccache -s || true
           echo "::endgroup::"
@@ -914,16 +1039,24 @@ jobs:
           ccache -p || true
           echo "::endgroup::"
 
+          echo "::group::Ccache directory size"
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+          find "$CCACHE_DIR" -maxdepth 2 -type f 2>/dev/null | head -50 || true
+          echo "::endgroup::"
+
           echo "::group::Ccache log tail"
           if [ -f "$CCACHE_LOGFILE" ]; then
-            tail -n 200 "$CCACHE_LOGFILE" || true
+            tail -n 300 "$CCACHE_LOGFILE" || true
           else
-            echo "No ccache log found. Bazel may not be invoking ccache."
+            echo "No ccache log found. The build may have bypassed ccache."
           fi
           echo "::endgroup::"
 
-          HIT_RATE="$(ccache -s | grep -i "hit rate" | awk '{print $NF}' || echo "N/A")"
-          echo "CCACHE_HIT_RATE=${HIT_RATE}" >> "$GITHUB_ENV"
+          HIT_RATE="$(ccache -s | grep -i "hit rate" | awk '{print $NF}' | head -1 || echo "N/A")"
+          CACHEABLE="$(ccache -s | awk '/Cacheable calls:/ {print $3}' | head -1 || echo "0")"
+
+          echo "CCACHE_HIT_RATE=${HIT_RATE:-N/A}" >> "$GITHUB_ENV"
+          echo "CCACHE_CACHEABLE_CALLS=${CACHEABLE:-0}" >> "$GITHUB_ENV"
 
       - name: Make AnyKernel3
         shell: bash
@@ -935,16 +1068,21 @@ jobs:
           mkdir -p kernel_workspace/out/Final-Image-Find/
 
           SEARCH_PATHS=(
-            "kernel_workspace/out/*/dist"
-            "kernel_workspace/common/out/*/dist"
+            "kernel_workspace/out"
+            "kernel_workspace/common/out"
             "kernel_workspace/bazel-bin/common"
-            "kernel_workspace/bazel-bin/common/kernel_aarch64"
-            "kernel_workspace/bazel-bin/common/kernel_aarch64_dist"
           )
 
           image_path=""
-          for search_path in "${SEARCH_PATHS[@]}"; do
-            image_path="$(find $search_path -name "Image" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+
+          for base in "${SEARCH_PATHS[@]}"; do
+            [ -d "$base" ] || continue
+
+            image_path="$(find "$base" \
+              \( -path "*/dist/Image" -o -path "*/kernel_aarch64/Image" -o -name "Image" \) \
+              -type f \
+              -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+
             if [ -n "$image_path" ] && [ -f "$image_path" ]; then
               echo "✅ Image found: $image_path"
               break
@@ -953,6 +1091,8 @@ jobs:
 
           if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
             echo "❌ ERROR: Image file not found"
+            echo "Debug: searching workspace for Image candidates..."
+            find kernel_workspace -name "Image" -type f -print 2>/dev/null | head -50 || true
             exit 1
           fi
 
@@ -1015,9 +1155,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           suf=""
+
           [ "${{ inputs.KPM }}" = "KPM" ] && suf="${suf}_KPM"
           [ "${LSM_ENABLED}" = "1" ] && suf="${suf}_LSM"
+
           echo "value=${suf}" >> "$GITHUB_OUTPUT"
 
       - name: Zip AnyKernel3
@@ -1029,6 +1172,7 @@ jobs:
           echo "📦 Creating: $ZIP_NAME"
 
           SUSFS_MODULE_PRESENT=false
+
           if [ "${{ inputs.SUSFS_META }}" != "-1" ]; then
             if ls AnyKernel3/ksu_module_susfs*.zip 1>/dev/null 2>&1; then
               SUSFS_MODULE_PRESENT=true
@@ -1050,6 +1194,7 @@ jobs:
           cd ..
 
           echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
           ZIP_SIZE=$(du -h "${GITHUB_WORKSPACE}/${ZIP_NAME}" | awk '{print $1}')
           echo "ZIP_SIZE=${ZIP_SIZE}" >> "$GITHUB_ENV"
 
@@ -1081,6 +1226,7 @@ jobs:
           fi
 
           BUILD_LOG="kernel_workspace/build.log"
+
           if [ -f "$BUILD_LOG" ]; then
             WARNINGS_COUNT="$(grep -c "warning:" "$BUILD_LOG" 2>/dev/null || echo 0)"
           else
@@ -1129,6 +1275,7 @@ jobs:
           IMAGE_SHA256="${IMAGE_SHA256:-N/A}"
           IMAGE_SIZE="${IMAGE_SIZE:-N/A}"
           CCACHE_HIT_RATE="${CCACHE_HIT_RATE:-N/A}"
+          CCACHE_CACHEABLE_CALLS="${CCACHE_CACHEABLE_CALLS:-N/A}"
 
           if [ "${{ job.status }}" = "success" ]; then
             STATUS_TEXT="SUCCESS"
@@ -1190,6 +1337,8 @@ jobs:
           | Metric | Value |
           |--------|-------|
           | Ccache Hit Rate | ${CCACHE_HIT_RATE} |
+          | Ccache Cacheable Calls | ${CCACHE_CACHEABLE_CALLS} |
+          | Bazel Cache Dir | ${BAZEL_CACHE_DIR} |
           | Parallel Jobs | $(nproc) cores |
 
           EOF
@@ -1239,6 +1388,7 @@ jobs:
           Image SHA256: ${IMAGE_SHA256:-N/A}
 
           Ccache Hit Rate: ${CCACHE_HIT_RATE:-N/A}
+          Ccache Cacheable Calls: ${CCACHE_CACHEABLE_CALLS:-N/A}
           Compiler Warnings: ${WARNINGS_COUNT:-N/A}
           EOF
 
@@ -1246,7 +1396,7 @@ jobs:
 
       - name: Upload Build Report
         if: always()
-        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8
+        uses: actions/upload-artifact@v4
         with:
           name: build_report_${{ inputs.DEVICE }}_${{ github.run_id }}
           path: build_report.txt
@@ -1255,7 +1405,7 @@ jobs:
 
       - name: Upload Build Log
         if: always()
-        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8
+        uses: actions/upload-artifact@v4
         with:
           name: build_log_${{ inputs.DEVICE }}_${{ github.run_id }}
           path: kernel_workspace/build.log
@@ -1264,7 +1414,7 @@ jobs:
 
       - name: Upload Ccache Log
         if: ${{ always() && !inputs.BUILD_NOCCACHE }}
-        uses: actions/upload-artifact@26f96dfa697d77e81fd5907df203aa23a56210a8
+        uses: actions/upload-artifact@v4
         with:
           name: ccache_log_${{ inputs.DEVICE }}_${{ github.run_id }}
           path: ccache.log
@@ -1283,6 +1433,11 @@ jobs:
 
           echo "📂 Top 10 Largest Directories:"
           du -h kernel_workspace 2>/dev/null | sort -rh | head -10 || true
+
+          echo "📦 Cache Directory Sizes:"
+          du -sh "$CCACHE_DIR" 2>/dev/null || true
+          du -sh "$BAZEL_CACHE_DIR" 2>/dev/null || true
+          du -sh "$BAZELISK_HOME" 2>/dev/null || true
 
           if [ "${BUILD_NOCCACHE_ENABLED}" != "1" ] && command -v ccache >/dev/null 2>&1; then
             ccache -s || true
@@ -1311,6 +1466,8 @@ jobs:
 
             # Do NOT delete:
             # - $CCACHE_DIR
+            # - $BAZEL_CACHE_DIR
+            # - $BAZELISK_HOME
             # - ~/.cache/bazel
             # - ~/.cache/bazelisk
             # GitHub cache post-step needs them.
@@ -1332,7 +1489,13 @@ jobs:
           sudo rm -rf /usr/local/lib/android 2>/dev/null || true
           sudo docker system prune -af 2>/dev/null || true
 
-          # Keep ccache and Bazel cache for actions/cache save.
+          # Keep ccache and Bazel cache for actions/cache save:
+          # - $CCACHE_DIR
+          # - $BAZEL_CACHE_DIR
+          # - $BAZELISK_HOME
+          # - ~/.cache/bazel
+          # - ~/.cache/bazelisk
+
           df -h
 
       - name: Final Status Check
@@ -1345,6 +1508,8 @@ jobs:
             echo "✅ Kernel ZIP: ${ZIP_NAME:-N/A}"
             echo "✅ Size: ${ZIP_SIZE:-N/A}"
             echo "✅ Duration: ${BUILD_TIME:-N/A}"
+            echo "✅ Ccache Hit Rate: ${CCACHE_HIT_RATE:-N/A}"
+            echo "✅ Ccache Cacheable Calls: ${CCACHE_CACHEABLE_CALLS:-N/A}"
           elif [ "${{ job.status }}" = "failure" ]; then
             echo "❌ BUILD FAILED"
             echo "❌ Device: ${DEVICE_NAME}"
