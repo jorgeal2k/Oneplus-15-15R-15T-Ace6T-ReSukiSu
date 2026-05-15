@@ -73,7 +73,7 @@ on:
         type: boolean
         description: "Enable network feature extensions (NETFILTER)?"
         required: true
-        default: true
+        default: false
 
       BBR_ECN:
         type: boolean
@@ -90,7 +90,7 @@ on:
       XUS_FIX:
         type: boolean
         description: "Prevent generation of 5US error files?"
-        required: true
+        required: false
         default: false
 
       SUSFS_DEV:
