@@ -217,6 +217,102 @@ jobs:
           echo "BUILD_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
           echo "BUILD_START_DATE=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
 
+      - name: Publish Build Plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.SUSFS_META }}" = "-1" ]; then
+            SUSFS_STATUS="Disabled"
+            SUSFS_VERSION_TEXT="N/A"
+          elif [ -z "${{ inputs.SUSFS_META }}" ]; then
+            SUSFS_STATUS="Enabled"
+            SUSFS_VERSION_TEXT="Latest upstream"
+          else
+            SUSFS_STATUS="Enabled"
+            SUSFS_VERSION_TEXT="${{ inputs.SUSFS_META }}"
+          fi
+
+          if [ "${{ inputs.SUFFIX }}" = "-1" ]; then
+            SUFFIX_TEXT="Disabled"
+          elif [ -z "${{ inputs.SUFFIX }}" ]; then
+            SUFFIX_TEXT="Random suffix"
+          else
+            SUFFIX_TEXT="${{ inputs.SUFFIX }}"
+          fi
+
+          if [ "${{ inputs.BUILD_TIME }}" = "-1" ]; then
+            BUILD_TIME_TEXT="Not modified"
+          elif [ "${{ inputs.BUILD_TIME }}" = "F" ] || [ "${{ inputs.BUILD_TIME }}" = "f" ] || [ -z "${{ inputs.BUILD_TIME }}" ]; then
+            BUILD_TIME_TEXT="Current UTC time"
+          else
+            BUILD_TIME_TEXT="${{ inputs.BUILD_TIME }}"
+          fi
+
+          if [ "${{ inputs.CREATE_RELEASE }}" = "true" ]; then
+            RELEASE_TEXT="Yes"
+          else
+            RELEASE_TEXT="No, artifact only"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # 🧭 Build Plan
+
+          This build plan was generated before source sync/build, so users can verify the selected configuration while the workflow is running.
+
+          ## Device & Kernel
+
+          | Setting | Value |
+          |--------|-------|
+          | Device | ${DEVICE_NAME} |
+          | Device codename | \`${DEVICE_CODENAME}\` |
+          | SoC | \`${CPU}\` |
+          | Android common branch | \`common-${KERNEL_BRANCH}\` |
+          | Kernel source | Android common kernel manifest |
+          | Workflow run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ## ReSukiSU
+
+          | Setting | Value |
+          |--------|-------|
+          | Manager variant | \`${{ inputs.MANAGER_SOURCE }}\` |
+          | setup.sh branch | \`${{ inputs.KSU_SETUP_BRANCH }}\` |
+          | KSU_META | \`${{ inputs.KSU_META }}\` |
+          | KPM mode | \`${{ inputs.KPM }}\` |
+
+          ## SUSFS
+
+          | Setting | Value |
+          |--------|-------|
+          | Status | ${SUSFS_STATUS} |
+          | Version / rollback | \`${SUSFS_VERSION_TEXT}\` |
+          | Module source | \`${{ inputs.SUSFS_CI }}\` |
+          | Use dev branch | \`${{ inputs.SUSFS_DEV }}\` |
+          | No_5uS fix | \`${{ inputs.XUS_FIX }}\` |
+
+          ## Kernel Customization
+
+          | Setting | Value |
+          |--------|-------|
+          | Kernel suffix | \`${SUFFIX_TEXT}\` |
+          | Build timestamp | \`${BUILD_TIME_TEXT}\` |
+          | SUBLEVEL spoof | \`${{ inputs.SUBLEVEL || 'Default' }}\` |
+          | Baseband Guard | \`${{ inputs.BASEBAND_GUARD }}\` |
+          | Netfilter | \`${{ inputs.NETFILTER }}\` |
+          | BBR + ECN | \`${{ inputs.BBR_ECN }}\` |
+          | Unicode bypass patch | \`${{ inputs.UNICODE_BYPASS }}\` |
+
+          ## Build Behavior
+
+          | Setting | Value |
+          |--------|-------|
+          | Ccache | ${{ !inputs.DISABLE_CCACHE && 'Enabled' || 'Disabled' }} |
+          | Disk cleanup | ${{ !inputs.SKIP_DISK_CLEANUP && 'Enabled' || 'Skipped' }} |
+          | Create GitHub release | ${RELEASE_TEXT} |
+          | Timeout | 150 minutes |
+
+          EOF
+
       - name: Validate Inputs
         shell: bash
         run: |
