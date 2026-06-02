@@ -1362,7 +1362,7 @@ jobs:
         if: ${{ inputs.CREATE_RELEASE != true }}
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.ZIP_NAME }}
+          name: artifact-${{ matrix.id }}-${{ github.run_id }}
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
           if-no-files-found: error
